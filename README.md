@@ -4,9 +4,9 @@ ResearchLab is a research-focused, Retrieval-Augmented Generation (RAG) applicat
 
 **Built with:** Python, Flask, HTML/CSS/JavaScript, PyMuPDF, pdfplumber, Sentence Transformers, Qdrant, and Groq.
 
-**[Explore the ResearchLab Showcase](https://kartiktomar03.github.io/ResearchLab-Showcase/)** · **[Source Code](https://github.com/kartiktomar03/Research-Paper-Assistant)**
+**[Source Code](https://github.com/Pratyaksh0x1/Research-paper-assistant)**
 
-> **Running the application:** ResearchLab is designed to run locally. Docker/Render configuration is included for optional deployment, but hosted availability and performance are not guaranteed. The showcase is a project website, not a live interactive instance of the backend.
+> **Running the application:** ResearchLab is designed to run locally. Docker/Render configuration is included for optional deployment, but hosted availability and performance are not guaranteed.
 
 ## Overview
 
@@ -172,8 +172,8 @@ Local `data/`, `uploads/`, `.env`, and `.venv/` files/directories may exist at r
 ### 1. Clone the repository
 
 ```powershell
-git clone https://github.com/kartiktomar03/Research-Paper-Assistant.git
-cd Research-Paper-Assistant
+git clone https://github.com/Pratyaksh0x1/Research-paper-assistant.git
+cd Research-paper-assistant
 ```
 
 ### 2. Create and activate a virtual environment
@@ -241,8 +241,6 @@ Open **http://127.0.0.1:5000** for the main workspace, or **http://127.0.0.1:500
 
 Docker and Render configuration files are retained in the repository. Hosting on limited free-tier compute may cause slow model initialization, indexing timeouts, or temporary unavailability. Local uploaded files and metadata are not inherently persistent on ephemeral hosting. For production use, plan appropriate persistent storage, authentication, access control, and resource limits.
 
-The **[ResearchLab Showcase](https://kartiktomar03.github.io/ResearchLab-Showcase/)** contains project screenshots and documentation; it should not be confused with a continuously available live Flask deployment.
-
 ## Known Limitations
 
 - Borderless and merged-cell table extraction can be incomplete or misaligned.
@@ -280,7 +278,3 @@ ResearchLab was developed further from the supplied Research-Paper-Analysis-Proj
 ## Disclaimer
 
 ResearchLab is an academic research assistance project. Verify summaries, extracted tables, numerical values, citations, and conclusions against original source papers before relying on them for research or publication.
-
-## Project Showcase
-
-**[Visit ResearchLab Showcase](https://kartiktomar03.github.io/ResearchLab-Showcase/)** — screenshots, architecture, and local setup guidance.
