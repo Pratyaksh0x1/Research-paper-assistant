@@ -437,67 +437,260 @@ def _save_source_crop(page, bbox, paper_dir, filename):
         return ""
 
 
-def _extract_formulas_optional(pdf_path, pdf, paper_id, paper_dir):
-    """Opt-in Docling formula enrichment. No model loading on Render by default.
+def _extract_tables_from_markdown(md_text: str, page_num: int, start_index: int = 1) -> list[dict[str, Any]]:
+    tables = []
+    lines = md_text.splitlines()
+    i = 0
+    current_index = start_index
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith("|") and line.endswith("|") and i + 1 < len(lines):
+            next_line = lines[i + 1].strip()
+            if re.match(r"^\|(\s*:?-+:?\s*\|)+$", next_line):
+                raw_rows = [line]
+                i += 2
+                while i < len(lines) and lines[i].strip().startswith("|") and lines[i].strip().endswith("|"):
+                    raw_rows.append(lines[i].strip())
+                    i += 1
 
-    If Docling isn't installed/configured, there are no invented equations.
-    The original PDF crop is kept where Docling supplies a bounding box.
-    """
-    if os.getenv("ENABLE_DOCLING_FORMULAS", "0").lower() not in ("1", "true", "yes"):
-        return []
-    try:
-        from docling.document_converter import DocumentConverter, PdfFormatOption
-        from docling.datamodel.base_models import InputFormat
-        from docling.datamodel.pipeline_options import PdfPipelineOptions
-        opts = PdfPipelineOptions()
-        opts.do_formula_enrichment = True
-        opts.do_table_structure = True
-        converter = DocumentConverter(format_options={InputFormat.PDF: PdfFormatOption(pipeline_options=opts)})
-        document = converter.convert(str(pdf_path)).document
-        items = list(document.iterate_items())
-    except Exception as exc:
-        import logging
-        logging.getLogger(__name__).warning("Docling unavailable or failed; formula enrichment skipped: %s", exc)
-        return []
+                parsed_rows = []
+                for tline in raw_rows:
+                    cells = [c.strip() for c in tline[1:-1].split("|")]
+                    parsed_rows.append(cells)
+
+                if len(parsed_rows) >= 2:
+                    headers = parsed_rows[0]
+                    data_rows = parsed_rows[1:]
+                    ident = f"table_{current_index}"
+                    md = _table_to_markdown(parsed_rows)
+                    caption = f"Table on page {page_num}"
+                    lookback_start = max(0, i - len(raw_rows) - 4)
+                    lookback_end = max(0, i - len(raw_rows) - 1)
+                    for idx_prev in range(lookback_start, lookback_end):
+                        prev = lines[idx_prev].strip()
+                        if re.match(r"^(?:table|tab\.?)\s*\d+", prev, re.I):
+                            caption = prev[:220]
+                            break
+                    tables.append({
+                        "table_id": ident,
+                        "page": page_num,
+                        "caption": caption,
+                        "markdown": md,
+                        "columns": headers,
+                        "rows": data_rows,
+                        "bbox": [],
+                        "image_url": "",
+                        "row_count": len(data_rows),
+                        "column_count": len(headers),
+                        "content": f"{caption} (page {page_num})\n{md}"
+                    })
+                    current_index += 1
+                continue
+        i += 1
+    return tables
+
+
+def _extract_formulas_from_markdown(md_text: str, page_num: int, start_index: int = 1) -> list[dict[str, Any]]:
     formulas = []
-    for entry in items:
-        item = entry[0] if isinstance(entry, tuple) else entry
-        label = str(getattr(item, "label", "")).lower()
-        if "formula" not in label:
-            continue
-        latex = str(getattr(item, "text", "") or getattr(item, "orig", "") or "").strip()
-        if not latex:
-            continue
-        prov = getattr(item, "prov", None) or []
-        if not prov:
-            continue
-        source = prov[0]
-        num = int(getattr(source, "page_no", 0) or 0)
-        if not 1 <= num <= len(pdf):
-            continue
-        bbox = getattr(source, "bbox", None)
-        coords = None
-        if bbox is not None:
-            coords = [getattr(bbox, k, None) for k in ("l", "t", "r", "b")]
-            if any(v is None for v in coords):
-                coords = None
-            else:
-                # Docling may use bottom-left coordinates. Convert into fitz top-left.
-                origin = str(getattr(bbox, "coord_origin", "")).lower()
-                if "bottomleft" in origin or "bottom_left" in origin:
-                    h = pdf[num-1].rect.height
-                    coords = [coords[0], h - coords[3], coords[2], h - coords[1]]
-        ident = f"formula_{len(formulas) + 1}"
-        filename = f"{paper_id}_formula_{len(formulas) + 1}.png"
-        saved = _save_source_crop(pdf[num-1], coords, paper_dir, filename) if coords else ""
-        formulas.append({"formula_id": ident, "page": num, "latex": latex,
-            "image_url": f"/api/figure/{paper_id}/{saved}" if saved else "",
-            "bbox": coords, "verified": False,
-            "content": f"Formula on page {num}: {latex}"})
+    current_index = start_index
+    display_matches = re.findall(r"\$\$([\s\S]+?)\$\$", md_text)
+    bracket_matches = re.findall(r"\\\[([\s\S]+?)\\\]", md_text)
+
+    seen = set()
+    for raw in display_matches + bracket_matches:
+        latex = raw.strip()
+        if len(latex) >= 2 and latex not in seen:
+            seen.add(latex)
+            ident = f"formula_{current_index}"
+            formulas.append({
+                "formula_id": ident,
+                "page": page_num,
+                "latex": latex,
+                "image_url": "",
+                "bbox": None,
+                "verified": True,
+                "content": f"Formula on page {page_num}: {latex}"
+            })
+            current_index += 1
+
     return formulas
 
 
+def _process_with_llamaparse(pdf_path: Path, paper_id: str, original_name: str, figure_dir: Path) -> dict[str, Any] | None:
+    api_key = os.getenv("LLAMA_CLOUD_API_KEY", "").strip()
+    if not api_key:
+        return None
+    try:
+        from llama_parse import LlamaParse
+        parser = LlamaParse(
+            api_key=api_key,
+            result_type="markdown",
+            split_by_page=True,
+            verbose=False,
+            parsing_instruction="Extract all content from the PDF. Convert every table into standard markdown table format with rows and columns. Convert all mathematical equations, formulas, and expressions into clean LaTeX code using $ for inline math and $$ for display math. Transcribe diagrams and figures with descriptive text.",
+        )
+        docs = parser.load_data(str(pdf_path))
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).warning("LlamaParse execution failed; falling back to local extractor: %s", exc)
+        return None
+
+    if not docs:
+        return None
+
+    pages = []
+    page_texts = []
+    tables = []
+    formulas = []
+
+    for idx, doc in enumerate(docs):
+        page_num = idx + 1
+        page_md = doc.text or ""
+        page_texts.append(page_md)
+        pages.append(f"[PAGE {page_num}]\n{page_md}" if page_md else f"[PAGE {page_num}]\n[No extractable text]")
+
+        page_tables = _extract_tables_from_markdown(page_md, page_num, len(tables) + 1)
+        tables.extend(page_tables)
+
+        page_formulas = _extract_formulas_from_markdown(page_md, page_num, len(formulas) + 1)
+        formulas.extend(page_formulas)
+
+    figures = []
+    paper_fig_dir = figure_dir / paper_id
+    paper_fig_dir.mkdir(parents=True, exist_ok=True)
+    vision = LLMService()
+
+    with fitz.open(pdf_path) as pdf:
+        page_count = len(pdf)
+        reported = (pdf.metadata or {}).get("title", "")
+        title = reported.strip() if reported and len(reported.strip()) > 8 else Path(original_name).stem.replace("_", " ")
+        metadata = _paper_metadata(pdf[0], title) if page_count else {"title": title, "authors": "", "abstract": ""}
+        title = metadata["title"]
+
+        for idx, page in enumerate(pdf):
+            num = idx + 1
+            fig_captions = _caption_candidates(page, "figure")
+            tab_captions = _caption_candidates(page, "table")
+
+            for t in tables:
+                if t["page"] == num and not t["image_url"]:
+                    for tc in tab_captions:
+                        crop_name = _save_source_crop(
+                            page,
+                            [tc["rect"].x0 - 5, max(0, tc["rect"].y0 - 250), min(page.rect.width, tc["rect"].x1 + 350), tc["rect"].y1 + 250],
+                            paper_fig_dir,
+                            f"{paper_id}_table_{t['table_id']}.png"
+                        )
+                        if crop_name:
+                            t["image_url"] = f"/api/figure/{paper_id}/{crop_name}"
+                            break
+
+            for fc in fig_captions:
+                clip = _figure_bounds(page, fc)
+                if clip is None:
+                    continue
+                try:
+                    pix = page.get_pixmap(matrix=fitz.Matrix(1.6, 1.6), clip=clip, alpha=False, colorspace=fitz.csRGB)
+                    filename = f"{paper_id}_{len(figures) + 1}.png"
+                    path = paper_fig_dir / filename
+                    pix.save(path)
+                    if path.stat().st_size < 3500:
+                        path.unlink(missing_ok=True)
+                        continue
+                    description = _vision_description(path, vision)
+                    caption = fc["text"]
+                    figures.append({
+                        "figure_id": f"figure_{len(figures) + 1}",
+                        "page": num,
+                        "caption": caption,
+                        "description": description,
+                        "image_url": f"/api/figure/{paper_id}/{filename}",
+                        "filename": filename,
+                        "content": f"Figure on page {num}. Caption: {caption}. Visual description: {description or 'Image preview available; visual details not verified.'}"
+                    })
+                except Exception:
+                    continue
+
+            if not fig_captions:
+                seen = set()
+                for image in page.get_images(full=True):
+                    xref = image[0]
+                    if xref in seen:
+                        continue
+                    seen.add(xref)
+                    try:
+                        rects = page.get_image_rects(xref)
+                        if not rects:
+                            continue
+                        rect = max(rects, key=lambda r: r.get_area())
+                        if rect.width < 110 or rect.height < 80 or rect.get_area() < 9000:
+                            continue
+                        pix = page.get_pixmap(matrix=fitz.Matrix(1.6, 1.6), clip=rect, alpha=False, colorspace=fitz.csRGB)
+                        filename = f"{paper_id}_{len(figures) + 1}.png"
+                        path = paper_fig_dir / filename
+                        pix.save(path)
+                        if path.stat().st_size < 3500:
+                            path.unlink(missing_ok=True)
+                            continue
+                        figures.append({
+                            "figure_id": f"figure_{len(figures) + 1}",
+                            "page": num,
+                            "caption": f"Uncaptioned image, page {num}",
+                            "description": "",
+                            "image_url": f"/api/figure/{paper_id}/{filename}",
+                            "filename": filename,
+                            "content": f"Uncaptioned image on page {num}; visually inspect preview."
+                        })
+                    except Exception:
+                        continue
+
+    full_text = "\n\n".join(pages)
+    sections = _sections_from_pages(full_text)
+    chunks = _make_chunks(full_text, page_texts, tables, figures)
+
+    for formula in formulas:
+        chunks.append({
+            "text": formula["content"],
+            "content_type": "formula",
+            "page": formula["page"],
+            "label": formula["formula_id"]
+        })
+
+    if metadata["abstract"]:
+        chunks.insert(0, {
+            "text": f"[Paper metadata]\nTitle: {title}\nAuthors: {metadata['authors']}\nAbstract: {metadata['abstract']}",
+            "content_type": "metadata",
+            "page": 1,
+            "label": "Paper metadata"
+        })
+
+    return {
+        "title": title,
+        "authors": metadata["authors"],
+        "abstract": metadata["abstract"],
+        "page_count": len(docs),
+        "full_text": full_text,
+        "sections": sections,
+        "tables": tables,
+        "figures": figures,
+        "formulas": formulas,
+        "chunks": chunks,
+    }
+
+
+def _extract_formulas_optional(pdf_path, pdf, paper_id, paper_dir):
+    """Legacy helper stub maintained for backwards compatibility."""
+    return []
+
+
 def process_pdf(pdf_path: Path, paper_id: str, original_name: str, figure_dir: Path) -> dict[str, Any]:
+    # 1. Cloud LlamaParse extraction (fast, offloads CPU, accurate LaTeX formulas and tables)
+    if os.getenv("LLAMA_CLOUD_API_KEY", "").strip():
+        parsed = _process_with_llamaparse(pdf_path, paper_id, original_name, figure_dir)
+        if parsed is not None:
+            return parsed
+
+    # 2. Local fallback pipeline
     pages=[];page_texts=[];figures=[];tables=[];formulas=[]
     paper_fig_dir=figure_dir/paper_id;paper_fig_dir.mkdir(parents=True,exist_ok=True)
     vision=LLMService();title=Path(original_name).stem.replace("_"," ")
